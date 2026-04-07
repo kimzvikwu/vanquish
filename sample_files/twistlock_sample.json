@@ -1,0 +1,19 @@
+{
+  "vulnerabilities": [
+    {
+      "id": "CVE-2023-XXXX",
+      "severity": "critical",
+      "packageName": "example-pkg",
+      "packageVersion": "1.2.3",
+      "fixVersion": "1.2.4",
+      "cveLink": "..."
+    }
+  ],
+  "compliance": [
+    {
+      "id": "123",
+      "title": "Ensure ...",
+      "severity": "high"
+    }
+  ]
+}

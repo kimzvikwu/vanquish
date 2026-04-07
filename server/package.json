@@ -1,0 +1,19 @@
+{
+  "name": "vanquish-server",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "dev": "node index.js",
+    "init-db": "node init_db.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "csv-parse": "^5.4.1",
+    "csv-stringify": "^6.4.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.4",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.11.3"
+  }
+}
