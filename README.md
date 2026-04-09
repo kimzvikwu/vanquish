@@ -16,25 +16,31 @@ A React frontend and Express backend for ingesting vulnerability reports from CS
    cp server/.env.example server/.env
    ```
 
-2. Install dependencies:
+2. Set your NIST API key in the environment:
+
+   For Docker: Create a `.env` file in the root with `NIST_KEY=your_api_key`
+
+   For local: Add `NIST_KEY=your_api_key` to `server/.env`
+
+3. Install dependencies:
 
    ```bash
    npm run install-all
    ```
 
-3. Create the PostgreSQL database and schema:
+4. Create the PostgreSQL database and schema:
 
    ```bash
    npm run setup-db
    ```
 
-4. Start both applications:
+5. Start both applications:
 
    ```bash
    npm run dev
    ```
 
-5. Open the React app at `http://localhost:5173`.
+6. Open the React app at `http://localhost:5173`.
 
 ### Using Docker for PostgreSQL
 

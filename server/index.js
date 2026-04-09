@@ -6,6 +6,7 @@ const { stringify } = require('csv-stringify/sync');
 const db = require('./db');
 const fs = require('fs');
 const path = require('path');
+const xml2js = require('xml2js');
 require('dotenv').config();
 
 const app = express();
@@ -36,6 +37,15 @@ const buildOCSF = (item, sourceType) => {
   const remediation = item['Remediation'] || item.remediation || item['Fix'] || item.fix || 'Remediation action required.';
   const detectedAt = item['Detected At'] || item.detected_at || item['Timestamp'] || item.timestamp || new Date().toISOString();
 
+  let detectorId = '';
+  if (sourceType === 'nessus') {
+    detectorId = item['Plugin ID'] || item.plugin_id || '';
+  } else if (sourceType === 'twistlock') {
+    detectorId = item['CVE'] || item.cve || '';
+  } else if (sourceType === 'zap') {
+    detectorId = item['CWE'] || item.cwe || '';
+  }
+
   return {
     schema_version: '1.0',
     source: sourceType,
@@ -50,6 +60,7 @@ const buildOCSF = (item, sourceType) => {
       category,
       severity,
       remediation,
+      detector_id: detectorId,
     },
     event: {
       detected_at: detectedAt,
@@ -58,18 +69,141 @@ const buildOCSF = (item, sourceType) => {
   };
 };
 
-const insertFinding = async (ocsf, source) => {
-  const severity = ocsf.vulnerability.severity || 'unknown';
-  const assetName = ocsf.asset.name || 'unknown';
-  const vulnerabilityId = ocsf.vulnerability.id || 'unknown';
-
-  const insert = `
-    INSERT INTO ocsf_findings (source, severity, asset_name, vulnerability_id, ocsf)
-    VALUES ($1, $2, $3, $4, $5)
-    RETURNING id;
-  `;
-  const result = await db.query(insert, [source, severity, assetName, vulnerabilityId, ocsf]);
+const insertFinding = async (ocsf, sourceType) => {
+  const result = await db.query(
+    `INSERT INTO ocsf_findings (source, severity, asset_name, vulnerability_id, ocsf)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, source, severity, asset_name, vulnerability_id, ocsf, created_at`,
+    [
+      sourceType,
+      String(ocsf?.vulnerability?.severity || 'unknown').toLowerCase(),
+      ocsf?.asset?.name || 'unknown-asset',
+      ocsf?.vulnerability?.id || 'unknown-vuln',
+      ocsf,
+    ]
+  );
   return result.rows[0];
+};
+
+const insertKev = async (item) => {
+  const cveId = item.cveID || item.cveId || item.CVE || item.cve_id;
+  if (!cveId) return null;
+
+  const result = await db.query(
+    `INSERT INTO kev (
+      cve_id,
+      vendor_project,
+      product,
+      vulnerability_name,
+      date_added,
+      short_description,
+      required_action,
+      due_date,
+      known_ransomware_campaign_use,
+      notes,
+      raw
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    ON CONFLICT (cve_id) DO UPDATE SET
+      vendor_project = EXCLUDED.vendor_project,
+      product = EXCLUDED.product,
+      vulnerability_name = EXCLUDED.vulnerability_name,
+      date_added = EXCLUDED.date_added,
+      short_description = EXCLUDED.short_description,
+      required_action = EXCLUDED.required_action,
+      due_date = EXCLUDED.due_date,
+      known_ransomware_campaign_use = EXCLUDED.known_ransomware_campaign_use,
+      notes = EXCLUDED.notes,
+      raw = EXCLUDED.raw
+    RETURNING *`,
+    [
+      cveId,
+      item.vendorProject || '',
+      item.product || '',
+      item.vulnerabilityName || '',
+      item.dateAdded || null,
+      item.shortDescription || '',
+      item.requiredAction || '',
+      item.dueDate || null,
+      item.knownRansomwareCampaignUse || '',
+      item.notes || '',
+      item,
+    ]
+  );
+
+  return result.rows[0];
+};
+
+const insertCvss = async (cveId, cvssScore, cvssVector, severity) => {
+  const insert = `
+    INSERT INTO cvss (cve_id, cvss_score, cvss_vector, severity)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (cve_id) DO UPDATE SET
+      cvss_score = EXCLUDED.cvss_score,
+      cvss_vector = EXCLUDED.cvss_vector,
+      severity = EXCLUDED.severity;
+  `;
+  await db.query(insert, [cveId, cvssScore, cvssVector, severity]);
+};
+
+const fetchCvssFromNist = async (cveId) => {
+  const apiKey = process.env.NIST_KEY;
+  if (!apiKey) {
+    throw new Error('NIST_KEY not set');
+  }
+  const url = `https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=${cveId}`;
+  const response = await fetch(url, {
+    headers: {
+      'apiKey': apiKey,
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`NIST API error: ${response.status}`);
+  }
+  const data = await response.json();
+  const vulnerabilities = data.vulnerabilities;
+  if (vulnerabilities && vulnerabilities.length > 0) {
+    const cve = vulnerabilities[0].cve;
+    const metrics = cve.metrics;
+    if (metrics && metrics.cvssMetricV31 && metrics.cvssMetricV31.length > 0) {
+      const cvss = metrics.cvssMetricV31[0].cvssData;
+      return {
+        score: cvss.baseScore,
+        vector: cvss.vectorString,
+        severity: cvss.baseSeverity,
+      };
+    }
+  }
+  return null;
+};
+
+const populateCvss = async () => {
+  const result = await db.query('SELECT cve_id FROM kev');
+  const cves = result.rows;
+  let populated = 0;
+  for (const { cve_id } of cves) {
+    try {
+      const cvssData = await fetchCvssFromNist(cve_id);
+      if (cvssData) {
+        await insertCvss(cve_id, cvssData.score, cvssData.vector, cvssData.severity);
+        populated++;
+      }
+    } catch (error) {
+      console.error(`Error fetching CVSS for ${cve_id}:`, error);
+    }
+  }
+  return populated;
+};
+
+const ingestKev = async (items) => {
+  if (!Array.isArray(items)) {
+    throw new Error('Expected an array of KEV items.');
+  }
+  const inserted = [];
+  for (const item of items) {
+    const record = await insertKev(item);
+    if (record) inserted.push(record);
+  }
+  return inserted;
 };
 
 const ingestItems = async (items, sourceType) => {
@@ -85,21 +219,21 @@ const ingestItems = async (items, sourceType) => {
   return inserted;
 };
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body;
+  if (username === 'admin' && password === 'admin') {
+    res.json({ success: true });
+  } else {
+    res.status(401).json({ error: 'Invalid credentials' });
+  }
 });
 
-app.post('/api/upload/csv', upload.single('file'), async (req, res) => {
+app.post('/api/populate/cvss', async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'CSV file is required.' });
-    }
-    const content = req.file.buffer.toString('utf8');
-    const records = parse(content, { columns: true, skip_empty_lines: true });
-    const inserted = await ingestItems(records, 'csv');
-    res.json({ imported: inserted.length, items: inserted });
+    const populated = await populateCvss();
+    res.json({ populated });
   } catch (error) {
-    console.error('CSV upload error:', error);
+    console.error('Populate CVSS error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -119,6 +253,82 @@ app.post('/api/upload/json', async (req, res) => {
   }
 });
 
+app.post('/api/upload/csv', upload.single('file'), async (req, res) => {
+  try {
+    const csvData = req.file.buffer.toString('utf8');
+    const items = parse(csvData, { columns: true, skip_empty_lines: true });
+    const inserted = await ingestItems(items, 'nessus');
+    res.json({ imported: inserted.length, items: inserted });
+  } catch (error) {
+    console.error('CSV upload error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post('/api/upload/kev', upload.single('file'), async (req, res) => {
+  try {
+    const csvData = req.file.buffer.toString('utf8');
+    const items = parse(csvData, { columns: true, skip_empty_lines: true });
+    const inserted = await ingestKev(items);
+    res.json({ imported: inserted.length, items: inserted });
+  } catch (error) {
+    console.error('KEV upload error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post('/api/ingest/kev', async (req, res) => {
+  try {
+    const response = await fetch('https://www.cisa.gov/sites/default/files/csv/known_exploited_vulnerabilities.csv');
+    if (!response.ok) {
+      throw new Error(`Failed to download KEV file: ${response.status}`);
+    }
+
+    const csvData = await response.text();
+    const items = parse(csvData, { columns: true, skip_empty_lines: true });
+    const inserted = await ingestKev(items);
+    res.json({ imported: inserted.length, items: inserted });
+  } catch (error) {
+    console.error('KEV ingest error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post('/api/upload/xml', upload.single('file'), async (req, res) => {
+  try {
+    const xmlData = req.file.buffer.toString('utf8');
+    const parser = new xml2js.Parser();
+    const result = await parser.parseStringPromise(xmlData);
+    let items = [];
+    if (result.NessusClientData_v2 && result.NessusClientData_v2.Report) {
+      const report = result.NessusClientData_v2.Report[0];
+      if (report.ReportHost) {
+        for (const host of report.ReportHost) {
+          const assetName = host.$.name;
+          if (host.ReportItem) {
+            for (const item of host.ReportItem) {
+              items.push({
+                'Asset': assetName,
+                'Plugin ID': item.$.pluginID,
+                'Title': item.$.pluginName,
+                'Description': item.description ? item.description[0] : '',
+                'Severity': item.$.severity,
+                'Category': item.$.pluginFamily,
+                'Remediation': item.solution ? item.solution[0] : '',
+              });
+            }
+          }
+        }
+      }
+    }
+    const inserted = await ingestItems(items, 'nessus');
+    res.json({ imported: inserted.length, items: inserted });
+  } catch (error) {
+    console.error('XML upload error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
 app.get('/api/vulnerabilities', async (req, res) => {
   try {
     const result = await db.query('SELECT id, source, severity, asset_name, vulnerability_id, ocsf, created_at FROM ocsf_findings ORDER BY created_at DESC');
@@ -132,24 +342,46 @@ app.get('/api/vulnerabilities', async (req, res) => {
 app.get('/api/export/poam', async (req, res) => {
   try {
     const result = await db.query('SELECT id, source, severity, asset_name, vulnerability_id, ocsf, created_at FROM ocsf_findings ORDER BY severity DESC, created_at DESC');
-    const actions = result.rows.map((row) => ({
-      id: row.id,
-      asset: row.ocsf.asset.name,
-      asset_id: row.ocsf.asset.id,
-      vulnerability_id: row.ocsf.vulnerability.id,
-      title: row.ocsf.vulnerability.title,
-      description: row.ocsf.vulnerability.description,
-      severity: row.ocsf.vulnerability.severity,
-      remediation: row.ocsf.vulnerability.remediation,
-      source: row.source,
-      created_at: row.created_at,
-      status: 'Open',
-      milestone: 'Validate and remediate within 30 days',
-    }));
+    const actions = result.rows.map((row) => {
+      const scheduledCompletion = new Date();
+      scheduledCompletion.setDate(scheduledCompletion.getDate() + 30); // 30 days from now
+
+      return {
+        'POA&M ID': row.id,
+        'Control Identifier': row.ocsf.vulnerability.category || 'Unknown',
+        'Weakness Name': row.ocsf.vulnerability.title,
+        'Weakness Description': row.ocsf.vulnerability.description,
+        'Weakness Detector Source Identifier': row.ocsf.vulnerability.detector_id || 'N/A',
+        'Weakness Source Identifier': row.source,
+        'Status': 'Open',
+        'Resources Required': 'TBD',
+        'Scheduled Completion Date': scheduledCompletion.toISOString().split('T')[0],
+        'Milestones with Completion Dates': row.ocsf.vulnerability.remediation + ' - Due: ' + scheduledCompletion.toISOString().split('T')[0],
+        'Risk Rating': row.ocsf.vulnerability.severity.toUpperCase(),
+        'Asset': row.ocsf.asset.name,
+        'Vulnerability ID': row.ocsf.vulnerability.id,
+        'Created At': row.created_at.toISOString().split('T')[0],
+      };
+    });
 
     const csv = stringify(actions, {
       header: true,
-      columns: ['id', 'asset', 'asset_id', 'vulnerability_id', 'title', 'description', 'severity', 'remediation', 'source', 'created_at', 'status', 'milestone']
+      columns: [
+        'POA&M ID',
+        'Control Identifier',
+        'Weakness Name',
+        'Weakness Description',
+        'Weakness Detector Source Identifier',
+        'Weakness Source Identifier',
+        'Status',
+        'Resources Required',
+        'Scheduled Completion Date',
+        'Milestones with Completion Dates',
+        'Risk Rating',
+        'Asset',
+        'Vulnerability ID',
+        'Created At',
+      ]
     });
 
     res.setHeader('Content-Disposition', 'attachment; filename="poam-report.csv"');

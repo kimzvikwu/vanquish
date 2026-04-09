@@ -32,9 +32,12 @@ services:
     restart: unless-stopped
     ports:
       - '4000:4000'
+    volumes:
+      - ${HOME}/Downloads:/downloads
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/vanquish
       PORT: 4000
+      NIST_KEY: ${NIST_KEY}
     depends_on:
       - postgres
 
