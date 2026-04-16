@@ -4,6 +4,98 @@ import logoSrc from './logo-vanquish.png';
 
 const apiBase = import.meta.env.VITE_API_BASE || '/api';
 
+// ── CVSS 3.1 environmental score helpers (module scope) ──────────────────────
+const CVSS_AV  = { N:0.85, A:0.62, L:0.55, P:0.20 };
+const CVSS_AC  = { L:0.77, H:0.44 };
+const CVSS_PR_U = { N:0.85, L:0.62, H:0.27 };
+const CVSS_PR_C = { N:0.85, L:0.50, H:0.50 };
+const CVSS_UI  = { N:0.85, R:0.62 };
+const CVSS_IMP = { N:0.00, L:0.22, H:0.56 };
+const CVSS_REQ = { X:1.00, L:0.50, M:1.00, H:1.50 };
+
+const CVSS_ENV_METRICS = [
+  { group: 'Modified Base Metrics', items: [
+    { key:'MAV', label:'Modified Attack Vector',       opts:[['X','Not Defined'],['N','Network (0.85)'],['A','Adjacent (0.62)'],['L','Local (0.55)'],['P','Physical (0.20)']] },
+    { key:'MAC', label:'Modified Attack Complexity',   opts:[['X','Not Defined'],['L','Low (0.77)'],['H','High (0.44)']] },
+    { key:'MPR', label:'Modified Privileges Required', opts:[['X','Not Defined'],['N','None (0.85)'],['L','Low'],['H','High']] },
+    { key:'MUI', label:'Modified User Interaction',    opts:[['X','Not Defined'],['N','None (0.85)'],['R','Required (0.62)']] },
+    { key:'MS',  label:'Modified Scope',               opts:[['X','Not Defined'],['U','Unchanged'],['C','Changed']] },
+    { key:'MC',  label:'Modified Confidentiality',     opts:[['X','Not Defined'],['N','None (0.00)'],['L','Low (0.22)'],['H','High (0.56)']] },
+    { key:'MI',  label:'Modified Integrity',           opts:[['X','Not Defined'],['N','None (0.00)'],['L','Low (0.22)'],['H','High (0.56)']] },
+    { key:'MA',  label:'Modified Availability',        opts:[['X','Not Defined'],['N','None (0.00)'],['L','Low (0.22)'],['H','High (0.56)']] },
+  ]},
+  { group: 'Environmental Requirements', items: [
+    { key:'CR', label:'Confidentiality Requirement', opts:[['X','Not Defined (1.00)'],['L','Low (0.50)'],['M','Medium (1.00)'],['H','High (1.50)']] },
+    { key:'IR', label:'Integrity Requirement',       opts:[['X','Not Defined (1.00)'],['L','Low (0.50)'],['M','Medium (1.00)'],['H','High (1.50)']] },
+    { key:'AR', label:'Availability Requirement',    opts:[['X','Not Defined (1.00)'],['L','Low (0.50)'],['M','Medium (1.00)'],['H','High (1.50)']] },
+  ]},
+];
+
+const cvssRoundup = (x) => {
+  const i = Math.round(x * 100000);
+  return (i % 10000 === 0) ? i / 100000 : (Math.floor(i / 10000) + 1) / 10;
+};
+
+const parseCvssVector = (v) => {
+  if (!v) return null;
+  const str = v.replace(/^CVSS:[0-9.]+\//, '');
+  return Object.fromEntries(str.split('/').map(s => s.split(':')));
+};
+
+const calcEnvScore = (vectorStr, env) => {
+  const base = parseCvssVector(vectorStr);
+  if (!base) return null;
+  const mav = env.MAV !== 'X' ? CVSS_AV[env.MAV]  : CVSS_AV[base.AV];
+  const mac = env.MAC !== 'X' ? CVSS_AC[env.MAC]  : CVSS_AC[base.AC];
+  const mui = env.MUI !== 'X' ? CVSS_UI[env.MUI]  : CVSS_UI[base.UI];
+  const ms  = env.MS  !== 'X' ? env.MS             : base.S;
+  const prTable = ms === 'C' ? CVSS_PR_C : CVSS_PR_U;
+  const mpr = env.MPR !== 'X' ? prTable[env.MPR]   : prTable[base.PR];
+  const mc  = env.MC  !== 'X' ? CVSS_IMP[env.MC]  : CVSS_IMP[base.C];
+  const mi  = env.MI  !== 'X' ? CVSS_IMP[env.MI]  : CVSS_IMP[base.I];
+  const ma  = env.MA  !== 'X' ? CVSS_IMP[env.MA]  : CVSS_IMP[base.A];
+  if ([mav,mac,mui,mpr,mc,mi,ma].some(v => v === undefined)) return null;
+  const cr = CVSS_REQ[env.CR]; const ir = CVSS_REQ[env.IR]; const ar = CVSS_REQ[env.AR];
+  const modISC = Math.min(1 - (1-mc*cr)*(1-mi*ir)*(1-ma*ar), 0.915);
+  const modISCScoped = ms === 'U'
+    ? 6.42 * modISC
+    : 7.52*(modISC-0.029) - 3.25*Math.pow(modISC-0.02, 15);
+  if (modISCScoped <= 0) return 0.0;
+  const modExp = 8.22 * mav * mac * mpr * mui;
+  const raw = ms === 'U'
+    ? cvssRoundup(Math.min(modISCScoped + modExp, 10))
+    : cvssRoundup(Math.min(1.08*(modISCScoped + modExp), 10));
+  return cvssRoundup(raw);
+};
+
+const getCvssScoreLabel = (score) => {
+  if (score === null || score === undefined) return '';
+  if (score >= 9.0) return 'Critical';
+  if (score >= 7.0) return 'High';
+  if (score >= 4.0) return 'Medium';
+  if (score > 0)   return 'Low';
+  return 'None';
+};
+
+const getCvssScoreClass = (score) => {
+  if (score === null || score === undefined) return 'none';
+  if (score >= 9.0) return 'critical';
+  if (score >= 7.0) return 'high';
+  if (score >= 4.0) return 'medium';
+  if (score > 0)   return 'low';
+  return 'none';
+};
+
+const getSeverityBadgeClass = (severity) => {
+  switch (String(severity).toLowerCase()) {
+    case 'critical': return 'severity-badge-critical';
+    case 'high':     return 'severity-badge-high';
+    case 'medium':   return 'severity-badge-medium';
+    case 'low':      return 'severity-badge-low';
+    default:         return 'severity-badge-unknown';
+  }
+};
+
 function App() {
   const [findings, setFindings] = useState([]);
   const [message, setMessage] = useState('');
@@ -15,16 +107,23 @@ function App() {
   const [selectedFinding, setSelectedFinding] = useState(null);
   const [file, setFile] = useState(null);
   const [filters, setFilters] = useState({});
+  const [exceptionType, setExceptionType] = useState('');
+  const [exceptionJustification, setExceptionJustification] = useState('');
+  const [showCvssCalc, setShowCvssCalc] = useState(false);
+  const [cvssEnv, setCvssEnv] = useState({
+    MAV:'X', MAC:'X', MPR:'X', MUI:'X', MS:'X',
+    MC:'X', MI:'X', MA:'X', CR:'X', IR:'X', AR:'X'
+  });
+  const [pageSize, setPageSize] = useState(50);
+  const [currentPage, setCurrentPage] = useState(1);
 
   const handleFilter = (column, value) => {
-    console.log('Filtering', column, value);
-    setFilters(prev => ({
-      ...prev,
-      [column]: value
-    }));
+    setCurrentPage(1);
+    setFilters(prev => ({ ...prev, [column]: value }));
   };
 
   const clearFilter = (column) => {
+    setCurrentPage(1);
     const newFilters = { ...filters };
     delete newFilters[column];
     setFilters(newFilters);
@@ -41,13 +140,19 @@ function App() {
         source: String(finding.source ?? ''),
         detected: String(finding.created_at ? new Date(finding.created_at).toLocaleString() : ''),
       };
-
       return Object.entries(filters).every(([key, value]) => {
         if (!value) return true;
         return fieldMap[key]?.toLowerCase().includes(String(value).toLowerCase());
       });
     });
   }, [findings, filters]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredFindings.length / pageSize));
+
+  const pagedFindings = useMemo(() => {
+    const start = (currentPage - 1) * pageSize;
+    return filteredFindings.slice(start, start + pageSize);
+  }, [filteredFindings, currentPage, pageSize]);
 
   const severityCounts = useMemo(() => {
     const counts = { Critical: 0, High: 0, Medium: 0, Low: 0, Unknown: 0 };
@@ -234,6 +339,45 @@ function App() {
     }
   };
 
+  // ── useMemo: adjusted environmental CVSS score ──────────────────────────────
+  const adjustedCvssScore = useMemo(() => {
+    if (!selectedFinding || !showCvssCalc) return null;
+    const vector = selectedFinding.cvss_vector;
+    if (!vector) return null;
+    return calcEnvScore(vector, cvssEnv);
+  }, [selectedFinding, showCvssCalc, cvssEnv]);
+
+  // ── Reset exception state when a different finding is opened ────────────────
+  useEffect(() => {
+    if (selectedFinding) {
+      setExceptionType('');
+      setExceptionJustification('');
+      setShowCvssCalc(false);
+      setCvssEnv({ MAV:'X', MAC:'X', MPR:'X', MUI:'X', MS:'X', MC:'X', MI:'X', MA:'X', CR:'X', IR:'X', AR:'X' });
+    }
+  }, [selectedFinding?.id]);
+
+  const handleSaveException = () => {
+    if (!exceptionType || !exceptionJustification.trim()) {
+      setMessage('Please select an exception type and provide a justification.');
+      return;
+    }
+    const label = { false_positive:'False Positive', operational_requirement:'Operational Requirement', vendor_dependency:'Vendor Dependency', risk_adjustment:'Risk Adjustment' }[exceptionType];
+    const adj = adjustedCvssScore !== null ? ` (adjusted CVSS: ${adjustedCvssScore})` : '';
+    setMessage(`Risk exception "${label}"${adj} recorded for finding #${selectedFinding.id}.`);
+    setExceptionType('');
+    setExceptionJustification('');
+    setShowCvssCalc(false);
+  };
+
+  // ── Helper sub-components ────────────────────────────────────────────────────
+  const DetailField = ({ label, value, children }) => (
+    <div className="detail-field">
+      <div className="detail-field-label">{label}</div>
+      <div className="detail-field-value">{children ?? value ?? '—'}</div>
+    </div>
+  );
+
   const VulnerabilityList = ({ items }) => (
     <div className="space-y-2">
       {items.length === 0 ? (
@@ -245,7 +389,7 @@ function App() {
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 mb-1">
                   <span className="text-sm font-mono text-gray-500">{finding.id}</span>
-                  <span className={`px-2 py-0.5 text-xs rounded border ${finding.ocsf.vulnerability.severity === 'High' ? 'bg-red-50 text-red-900 border-red-200' : finding.ocsf.vulnerability.severity === 'Medium' ? 'bg-amber-50 text-amber-900 border-amber-200' : 'bg-blue-50 text-blue-900 border-blue-200'}`}>
+                  <span className={`severity-badge ${getSeverityBadgeClass(finding.ocsf.vulnerability.severity)}`}>
                     {finding.ocsf.vulnerability.severity}
                   </span>
                 </div>
@@ -302,7 +446,7 @@ function App() {
             <div className="header-content">
               <img className="logo" src={logoSrc} alt="Vanquish logo" />
               <div className="title-section">
-              <h2><strong>V</strong>ulnerablity <strong>A</strong>ssessment & <strong>N</strong>on-compliance <strong>Q</strong>ueue - <strong>U</strong>nified <strong>I</strong>ssue <strong>S</strong>tatus <strong>H</strong>ub</h2>
+              <h2>VANQUISH - <strong>U</strong>nified <strong>I</strong>ssue <strong>S</strong>tatus <strong>H</strong>ub</h2>
               </div>
             </div>
           </header>
@@ -322,7 +466,6 @@ function App() {
           {currentTab === 'main' && (
             <>
               <section className="panel">
-                <h2>Stored Findings</h2>
                 <div className="table-wrapper">
                   <table className="w-full">
                     <thead className="bg-gray-50 border-b border-gray-200">
@@ -485,16 +628,20 @@ function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredFindings.length === 0 && (
+                      {pagedFindings.length === 0 && (
                         <tr>
                           <td colSpan="7">No findings stored yet.</td>
                         </tr>
                       )}
-                      {filteredFindings.map((finding) => (
+                      {pagedFindings.map((finding) => (
                         <tr key={finding.id} onClick={() => setSelectedFinding(finding)} style={{ cursor: 'pointer' }}>
                           <td className="px-4 py-3">{finding.id}</td>
                           <td className="px-4 py-3">{finding.ocsf.asset.name}</td>
-                          <td className="px-4 py-3">{finding.ocsf.vulnerability.severity}</td>
+                          <td className="px-4 py-3">
+                            <span className={`severity-badge ${getSeverityBadgeClass(finding.ocsf.vulnerability.severity)}`}>
+                              {finding.ocsf.vulnerability.severity}
+                            </span>
+                          </td>
                           <td className="px-4 py-3">{finding.ocsf.vulnerability.title}</td>
                           <td className="px-4 py-3">{finding.ocsf.vulnerability.detector_id || 'N/A'}</td>
                           <td className="px-4 py-3">{finding.source}</td>
@@ -504,14 +651,177 @@ function App() {
                     </tbody>
                   </table>
                 </div>
+
+                {/* ── Pagination bar ── */}
+                <div className="pagination-bar">
+                  <div className="pagination-info">
+                    {filteredFindings.length === 0
+                      ? 'No results'
+                      : `${(currentPage - 1) * pageSize + 1}–${Math.min(currentPage * pageSize, filteredFindings.length)} of ${filteredFindings.length}`}
+                  </div>
+                  <div className="pagination-controls">
+                    <button className="page-btn" onClick={() => setCurrentPage(1)} disabled={currentPage === 1} title="First page">«</button>
+                    <button className="page-btn" onClick={() => setCurrentPage(p => p - 1)} disabled={currentPage === 1} title="Previous page">‹</button>
+                    <span className="page-indicator">Page {currentPage} of {totalPages}</span>
+                    <button className="page-btn" onClick={() => setCurrentPage(p => p + 1)} disabled={currentPage === totalPages} title="Next page">›</button>
+                    <button className="page-btn" onClick={() => setCurrentPage(totalPages)} disabled={currentPage === totalPages} title="Last page">»</button>
+                  </div>
+                  <div className="pagination-size">
+                    <label>Rows per page</label>
+                    <select
+                      value={pageSize}
+                      onChange={e => { setPageSize(Number(e.target.value)); setCurrentPage(1); }}
+                    >
+                      {[25, 50, 100, 250].map(n => <option key={n} value={n}>{n}</option>)}
+                    </select>
+                  </div>
+                </div>
               </section>
 
+              {/* ── Detail modal ── */}
               {selectedFinding && (
-                <section className="panel">
-                  <h2>Vulnerability Details</h2>
-                  <pre>{JSON.stringify(selectedFinding.ocsf, null, 2)}</pre>
-                  <button onClick={() => setSelectedFinding(null)}>Close</button>
-                </section>
+                <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) setSelectedFinding(null); }}>
+                  <div className="modal-panel">
+                    {/* Header */}
+                    <div className="finding-detail-header">
+                      <h2>Vulnerability Details</h2>
+                      <button className="btn-close" onClick={() => setSelectedFinding(null)}>✕ Close</button>
+                    </div>
+
+                    {/* Two-column: info + exception */}
+                    <div className="modal-body">
+                      <div className="finding-detail-grid">
+                        {/* Left: fields */}
+                        <div className="finding-detail-info">
+                          <DetailField label="CVE / Vuln ID"  value={selectedFinding.ocsf.vulnerability.detector_id || 'N/A'} />
+                          <DetailField label="Title"          value={selectedFinding.ocsf.vulnerability.title || 'N/A'} />
+                          <DetailField label="Description"    value={selectedFinding.ocsf.vulnerability.description} />
+                          <DetailField label="Severity">
+                            <span className={`severity-badge ${getSeverityBadgeClass(selectedFinding.ocsf.vulnerability.severity)}`}>
+                              {selectedFinding.ocsf.vulnerability.severity}
+                            </span>
+                          </DetailField>
+                          <DetailField label="Asset"     value={selectedFinding.ocsf.asset.name} />
+                          <DetailField label="Source"    value={selectedFinding.source} />
+                          <DetailField label="Detected"  value={new Date(selectedFinding.created_at).toLocaleString()} />
+                          {selectedFinding.cvss_score != null && (
+                            <DetailField label="CVSS3 Base Score">
+                              <span className={`cvss-score-badge cvss-score-${getCvssScoreClass(selectedFinding.cvss_score)}`}>
+                                {selectedFinding.cvss_score} — {getCvssScoreLabel(selectedFinding.cvss_score)}
+                              </span>
+                            </DetailField>
+                          )}
+                          {selectedFinding.cvss_vector && (
+                            <DetailField label="CVSS3 Vector">
+                              <code className="cvss-vector-code">{selectedFinding.cvss_vector}</code>
+                            </DetailField>
+                          )}
+                          {selectedFinding.ocsf.vulnerability.remediation && (
+                            <DetailField label="Remediation" value={selectedFinding.ocsf.vulnerability.remediation} />
+                          )}
+                        </div>
+
+                        {/* Right: risk exception form */}
+                        <div className="finding-risk-section">
+                          <h3>Risk Exception</h3>
+                          <div className="exception-type-group">
+                            {[
+                              ['false_positive',        'False Positive'],
+                              ['operational_requirement','Operational Requirement'],
+                              ['vendor_dependency',      'Vendor Dependency'],
+                              ['risk_adjustment',        'Risk Adjustment'],
+                            ].map(([val, lbl]) => (
+                              <label key={val} className={`exception-type-option${exceptionType === val ? ' active' : ''}`}>
+                                <input
+                                  type="radio"
+                                  name="exceptionType"
+                                  value={val}
+                                  checked={exceptionType === val}
+                                  onChange={() => { setExceptionType(val); setShowCvssCalc(false); }}
+                                />
+                                {lbl}
+                              </label>
+                            ))}
+                          </div>
+
+                          {exceptionType && (
+                            <div className="exception-fields">
+                              <label className="exception-label">Justification</label>
+                              <textarea
+                                rows={4}
+                                placeholder="Describe the justification for this risk exception…"
+                                value={exceptionJustification}
+                                onChange={e => setExceptionJustification(e.target.value)}
+                              />
+                              {exceptionType === 'risk_adjustment' && selectedFinding.cvss_score != null && (
+                                <button
+                                  type="button"
+                                  className="cvss-calc-toggle-btn"
+                                  onClick={() => setShowCvssCalc(v => !v)}
+                                >
+                                  {showCvssCalc ? '▲ Hide' : '▼ Open'} Environmental Risk Calculator
+                                </button>
+                              )}
+                              <div className="exception-actions">
+                                <button type="button" onClick={handleSaveException}>Save Exception</button>
+                                <button type="button" className="btn-secondary" onClick={() => { setExceptionType(''); setExceptionJustification(''); setShowCvssCalc(false); }}>
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* CVSS Environmental Calculator */}
+                      {showCvssCalc && (
+                        <div className="cvss-calculator-wrapper">
+                          <div className="cvss-sticky-scores">
+                            <div className="cvss-score-row">
+                              <div className="cvss-score-item">
+                                <div className="cvss-score-label">Base Score</div>
+                                <div className={`cvss-score-value cvss-score-${getCvssScoreClass(selectedFinding.cvss_score)}`}>
+                                  {selectedFinding.cvss_score}
+                                </div>
+                                <div className="cvss-score-severity">{getCvssScoreLabel(selectedFinding.cvss_score)}</div>
+                              </div>
+                              <div className="cvss-score-arrow">→</div>
+                              <div className="cvss-score-item">
+                                <div className="cvss-score-label">Adjusted Score</div>
+                                <div className={`cvss-score-value cvss-score-${getCvssScoreClass(adjustedCvssScore)}`}>
+                                  {adjustedCvssScore !== null ? adjustedCvssScore : '—'}
+                                </div>
+                                <div className="cvss-score-severity">{getCvssScoreLabel(adjustedCvssScore)}</div>
+                              </div>
+                            </div>
+                            {selectedFinding.cvss_vector && (
+                              <div className="cvss-base-vector">Base vector: {selectedFinding.cvss_vector}</div>
+                            )}
+                          </div>
+                          <div className="cvss-metrics-scroll">
+                            {CVSS_ENV_METRICS.map(({ group, items }) => (
+                              <div key={group} className="cvss-metric-group">
+                                <div className="cvss-metric-group-title">{group}</div>
+                                {items.map(({ key, label, opts }) => (
+                                  <div key={key} className="cvss-metric-row">
+                                    <label className="cvss-metric-label">{label}</label>
+                                    <select
+                                      className="cvss-metric-select"
+                                      value={cvssEnv[key]}
+                                      onChange={e => setCvssEnv(prev => ({ ...prev, [key]: e.target.value }))}
+                                    >
+                                      {opts.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                                    </select>
+                                  </div>
+                                ))}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
               )}
             </>
           )}

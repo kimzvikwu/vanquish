@@ -331,7 +331,13 @@ app.post('/api/upload/xml', upload.single('file'), async (req, res) => {
 
 app.get('/api/vulnerabilities', async (req, res) => {
   try {
-    const result = await db.query('SELECT id, source, severity, asset_name, vulnerability_id, ocsf, created_at FROM ocsf_findings ORDER BY created_at DESC');
+    const result = await db.query(`
+      SELECT f.id, f.source, f.severity, f.asset_name, f.vulnerability_id, f.ocsf, f.created_at,
+             c.cvss_score, c.cvss_vector
+      FROM ocsf_findings f
+      LEFT JOIN cvss c ON c.cve_id = f.vulnerability_id
+      ORDER BY f.created_at DESC
+    `);
     res.json({ findings: result.rows });
   } catch (error) {
     console.error('Fetch findings error:', error);
