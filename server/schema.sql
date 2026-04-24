@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS cvss (
   cvss_score TEXT,
   cvss_vector TEXT,
   severity TEXT,
+  cvss_version TEXT DEFAULT '3.1',
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -17,7 +18,8 @@ CREATE TABLE IF NOT EXISTS ocsf_findings (
   asset_name TEXT NOT NULL,
   vulnerability_id TEXT NOT NULL,
   ocsf JSONB NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (source, asset_name, vulnerability_id)
 );
 
 CREATE TABLE IF NOT EXISTS kev (

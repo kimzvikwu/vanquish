@@ -16,6 +16,8 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+
 const normalizeSeverity = (value) => {
   if (!value) return 'unknown';
   const severity = String(value).trim().toLowerCase();
@@ -27,14 +29,14 @@ const normalizeSeverity = (value) => {
 };
 
 const buildOCSF = (item, sourceType) => {
-  const assetName = item['Asset'] || item.asset || item['Asset Name'] || item.asset_name || 'unknown-asset';
+  const assetName = item['Asset'] || item.asset || item['Asset Name'] || item.asset_name || item['Host'] || item.host || 'unknown-asset';
   const assetId = item['Asset ID'] || item.asset_id || item.asset || assetName;
-  const vulnId = item['Vuln ID'] || item.vuln_id || item['Vulnerability ID'] || item.vulnerability_id || item.id || 'unknown-vuln';
+  const vulnId = item['CVE'] || item.cve || item['Vuln ID'] || item.vuln_id || item['Vulnerability ID'] || item.vulnerability_id || item.id || 'unknown-vuln';
   const title = item['Title'] || item.title || item['Name'] || item.name || 'Untitled finding';
   const description = item['Description'] || item.description || item['Details'] || item.details || 'No description provided';
-  const category = item['Category'] || item.category || item['Type'] || item.type || 'vulnerability';
-  const severity = normalizeSeverity(item['Severity'] || item.severity || item['Risk'] || item.risk);
-  const remediation = item['Remediation'] || item.remediation || item['Fix'] || item.fix || 'Remediation action required.';
+  const category = item['Category'] || item.category || item['Type'] || item.type || item['Plugin Family'] || item.plugin_family || 'vulnerability';
+  const severity = normalizeSeverity(item['Severity'] || item.severity || item['Risk'] || item.risk || item['CVSS']);
+  const remediation = item['Remediation'] || item.remediation || item['Solution'] || item.solution || item['Fix'] || item.fix || 'Remediation action required.';
   const detectedAt = item['Detected At'] || item.detected_at || item['Timestamp'] || item.timestamp || new Date().toISOString();
 
   let detectorId = '';
@@ -73,6 +75,9 @@ const insertFinding = async (ocsf, sourceType) => {
   const result = await db.query(
     `INSERT INTO ocsf_findings (source, severity, asset_name, vulnerability_id, ocsf)
      VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (source, asset_name, vulnerability_id) DO UPDATE SET
+       severity = EXCLUDED.severity,
+       ocsf     = EXCLUDED.ocsf
      RETURNING id, source, severity, asset_name, vulnerability_id, ocsf, created_at`,
     [
       sourceType,
@@ -133,16 +138,17 @@ const insertKev = async (item) => {
   return result.rows[0];
 };
 
-const insertCvss = async (cveId, cvssScore, cvssVector, severity) => {
+const insertCvss = async (cveId, cvssScore, cvssVector, severity, cvssVersion) => {
   const insert = `
-    INSERT INTO cvss (cve_id, cvss_score, cvss_vector, severity)
-    VALUES ($1, $2, $3, $4)
+    INSERT INTO cvss (cve_id, cvss_score, cvss_vector, severity, cvss_version)
+    VALUES ($1, $2, $3, $4, $5)
     ON CONFLICT (cve_id) DO UPDATE SET
       cvss_score = EXCLUDED.cvss_score,
       cvss_vector = EXCLUDED.cvss_vector,
-      severity = EXCLUDED.severity;
+      severity = EXCLUDED.severity,
+      cvss_version = EXCLUDED.cvss_version;
   `;
-  await db.query(insert, [cveId, cvssScore, cvssVector, severity]);
+  await db.query(insert, [cveId, cvssScore, cvssVector, severity, cvssVersion || '3.1']);
 };
 
 const fetchCvssFromNist = async (cveId) => {
@@ -151,27 +157,28 @@ const fetchCvssFromNist = async (cveId) => {
     throw new Error('NIST_KEY not set');
   }
   const url = `https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=${cveId}`;
-  const response = await fetch(url, {
-    headers: {
-      'apiKey': apiKey,
-    },
-  });
+  const response = await fetch(url, { headers: { 'apiKey': apiKey } });
   if (!response.ok) {
     throw new Error(`NIST API error: ${response.status}`);
   }
   const data = await response.json();
   const vulnerabilities = data.vulnerabilities;
-  if (vulnerabilities && vulnerabilities.length > 0) {
-    const cve = vulnerabilities[0].cve;
-    const metrics = cve.metrics;
-    if (metrics && metrics.cvssMetricV31 && metrics.cvssMetricV31.length > 0) {
-      const cvss = metrics.cvssMetricV31[0].cvssData;
-      return {
-        score: cvss.baseScore,
-        vector: cvss.vectorString,
-        severity: cvss.baseSeverity,
-      };
-    }
+  if (!vulnerabilities || vulnerabilities.length === 0) return null;
+  const metrics = vulnerabilities[0].cve.metrics;
+  if (!metrics) return null;
+
+  // Prefer CVSS v3.1, then v3.0, then v2.0
+  if (metrics.cvssMetricV31?.length > 0) {
+    const cvss = metrics.cvssMetricV31[0].cvssData;
+    return { score: cvss.baseScore, vector: cvss.vectorString, severity: cvss.baseSeverity, version: '3.1' };
+  }
+  if (metrics.cvssMetricV30?.length > 0) {
+    const cvss = metrics.cvssMetricV30[0].cvssData;
+    return { score: cvss.baseScore, vector: cvss.vectorString, severity: cvss.baseSeverity, version: '3.0' };
+  }
+  if (metrics.cvssMetricV2?.length > 0) {
+    const cvss = metrics.cvssMetricV2[0].cvssData;
+    return { score: cvss.baseScore, vector: cvss.vectorString, severity: metrics.cvssMetricV2[0].baseSeverity, version: '2.0' };
   }
   return null;
 };
@@ -184,7 +191,7 @@ const populateCvss = async () => {
     try {
       const cvssData = await fetchCvssFromNist(cve_id);
       if (cvssData) {
-        await insertCvss(cve_id, cvssData.score, cvssData.vector, cvssData.severity);
+        await insertCvss(cve_id, cvssData.score, cvssData.vector, cvssData.severity, cvssData.version);
         populated++;
       }
     } catch (error) {
@@ -333,7 +340,7 @@ app.get('/api/vulnerabilities', async (req, res) => {
   try {
     const result = await db.query(`
       SELECT f.id, f.source, f.severity, f.asset_name, f.vulnerability_id, f.ocsf, f.created_at,
-             c.cvss_score, c.cvss_vector
+             c.cvss_score, c.cvss_vector, c.cvss_version
       FROM ocsf_findings f
       LEFT JOIN cvss c ON c.cve_id = f.vulnerability_id
       ORDER BY f.created_at DESC
